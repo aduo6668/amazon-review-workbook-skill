@@ -141,6 +141,72 @@ python scripts/amazon_review_workbook.py keyword-autotune --output-dir "./amazon
 - `merge-build`
 - `summary`
 
+## 发布说明
+
+这个仓库的定位是“可公开复用的 skill 源码仓库”，不是私有工作目录镜像。
+
+### 发布边界
+
+发布前请确认以下内容不会进入仓库：
+
+- `.env`
+- `amazon-review-output/`
+- SQLite 缓存文件
+- `label_cache.jsonl`
+- 真实评论导出表格
+- 一次性本地调试脚本或临时分析产物
+
+### 推荐发布流程
+
+1. 先跑测试：
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+2. 确认 `.gitignore` 已覆盖本地产物。
+
+3. 检查 staged 文件，只保留这些类型：
+
+- `README.md`
+- `SKILL.md`
+- `references/`
+- `scripts/`
+- `tests/`
+- `agents/openai.yaml`
+- `.env.example`
+- `LICENSE`
+
+4. 提交前重点检查：
+
+- 是否有真实评论数据
+- 是否有本机绝对路径
+- 是否有 API Key / token / cookie
+- 是否把 `amazon-review-output` 里的实际样本带进去了
+
+5. 提交并推送：
+
+```bash
+git add .
+git commit -m "your message"
+git push origin main
+```
+
+### 版本建议
+
+如果改动较大，建议按下面的粒度发版：
+
+- `patch`：修 bug、改文档、小幅参数调整
+- `minor`：新增命令、新增 profile、新增非破坏性能力
+- `major`：改输出契约、改工作流主路径、移除旧参数
+
+### 发布后建议检查
+
+- 仓库首页 README 是否可直接教会新人配置
+- `LICENSE` 是否存在
+- `git clone` 后是否能按 README 跑通 `doctor --help`
+- `SKILL.md`、CLI 参数、README 三者是否一致
+
 ## 输出契约
 
 事实工作簿和最终工作簿都使用固定 14 列：
