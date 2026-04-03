@@ -16,6 +16,7 @@ from amazon_review_workbook import (
     build_keyword_tuning_state,
     build_keyword_profile,
     extract_page_totals,
+    merge_combo_rows,
     probe_cdp_endpoint,
     remaining_time_budget_seconds,
     resolve_keyword_plan,
@@ -280,6 +281,22 @@ class ReviewWorkbookContractTests(unittest.TestCase):
         finally:
             workbook.port_is_open = original_port_is_open
             workbook.requests.get = original_get
+
+    def test_merge_combo_rows_dedupes_across_parallel_results(self) -> None:
+        seen_ids = {"R1"}
+        output_rows = [{"review_id": "R1", "seq": "1"}]
+        added = merge_combo_rows(
+            output_rows,
+            seen_ids,
+            [
+                {"review_id": "R1", "title": "dup"},
+                {"review_id": "R2", "title": "new-2"},
+                {"review_id": "R3", "title": "new-3"},
+            ],
+        )
+        self.assertEqual(added, 2)
+        self.assertEqual([row["review_id"] for row in output_rows], ["R1", "R2", "R3"])
+        self.assertEqual([row["seq"] for row in output_rows], ["1", "2", "3"])
 
 
 if __name__ == "__main__":

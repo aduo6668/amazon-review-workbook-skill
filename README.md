@@ -112,6 +112,7 @@ python scripts/amazon_review_workbook.py merge-build --base-json "./amazon-revie
 - `--keyword-tier explore` 只跑长尾探索词，并优先更贴近当前 profile 的尾词
 - 不传 `--keyword-tier` 时默认是 `all`，兼容之前“整组 profile 一起跑”的行为
 - `--time-budget-minutes 5` 可以把一次试跑限制在 5 分钟左右；到点后脚本会停止启动新的 combo / keyword / page，并保留已经抓到的结果
+- `--combo-concurrency 2` 会在同一浏览器会话里并发开 2 个 combo tab，优先压缩总耗时；如果后续实测发现更高并发也稳定，再继续往上试
 - 内置 profile：
   - `generic`
   - `electronics`
@@ -132,6 +133,10 @@ python scripts/amazon_review_workbook.py intake --url "<amazon-url>" --output-di
 
 ```bash
 python scripts/amazon_review_workbook.py intake --url "<amazon-url>" --output-dir "./amazon-review-output" --keywords --keyword-profile electronics --keyword-tier core --time-budget-minutes 5
+```
+
+```bash
+python scripts/amazon_review_workbook.py intake --url "<amazon-url>" --output-dir "./amazon-review-output" --time-budget-minutes 5 --combo-concurrency 2
 ```
 
 ```bash

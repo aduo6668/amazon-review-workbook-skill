@@ -79,6 +79,7 @@ Examples:
 python scripts/amazon_review_workbook.py collect --url "<amazon-url>" --output-dir "<workspace>/amazon-review-output"
 python scripts/amazon_review_workbook.py collect --url "<amazon-url>" --output-dir "<workspace>/amazon-review-output" --keywords --keyword-profile electronics --keyword-tier core
 python scripts/amazon_review_workbook.py collect --url "<amazon-url>" --output-dir "<workspace>/amazon-review-output" --keywords --keyword-profile electronics --keyword-tier core --time-budget-minutes 5
+python scripts/amazon_review_workbook.py collect --url "<amazon-url>" --output-dir "<workspace>/amazon-review-output" --time-budget-minutes 5 --combo-concurrency 2
 python scripts/amazon_review_workbook.py translate --input-json "<workspace>/amazon-review-output/amazon_<asin>_review_rows_factual.json" --output-dir "<workspace>/amazon-review-output"
 python scripts/amazon_review_workbook.py coverage-check --url "<amazon-url>" --db-path "<workspace>/amazon-review-output/amazon_review_cache.sqlite3"
 python scripts/amazon_review_workbook.py keyword-autotune --output-dir "<workspace>/amazon-review-output" --db-path "<workspace>/amazon-review-output/amazon_review_cache.sqlite3"
@@ -131,6 +132,7 @@ The preferred fast path is:
 - Use `--keyword-tier explore` when you specifically want the long-tail exploration terms; this tier favors the most domain-specific tail words first.
 - Leave `--keyword-tier` at `all` to preserve the old behavior and run both tiers.
 - Use `--time-budget-minutes 5` when you want a bounded probe run first; the collector will stop opening new combos, keywords, or pages after the budget is exhausted and still keep partial output.
+- Use `--combo-concurrency 2` to parallelize combo collection across a few tabs in the same logged-in browser session. Keep this conservative and tune it from live results rather than pushing it aggressively.
 - Default pacing now inserts a `2.5s` gap between combos/keywords to reduce rate-limit risk.
 - Built-in profiles:
   - `generic`: universal consumer-product terms

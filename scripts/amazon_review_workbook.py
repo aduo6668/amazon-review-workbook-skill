@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import glob
 import json
 import logging
@@ -183,6 +184,7 @@ DEFAULT_KEYWORD_REUSE_SCOPE = "successful"
 DEFAULT_ZERO_RESULT_RETRY_HOURS = 72.0
 DEFAULT_KEYWORD_TUNING_TOP_K = 12
 DEFAULT_TIME_BUDGET_MINUTES = 0.0
+DEFAULT_COMBO_CONCURRENCY = 2
 
 logger = logging.getLogger("amazon_review_workbook")
 
@@ -506,6 +508,25 @@ def sleep_with_time_budget(seconds: float, deadline_monotonic: float | None) -> 
     if remaining <= 0:
         return
     time.sleep(min(seconds, remaining))
+
+
+def merge_combo_rows(
+    output_rows: list[dict[str, Any]],
+    seen_review_ids: set[str],
+    candidate_rows: list[dict[str, Any]],
+) -> int:
+    added = 0
+    for review in candidate_rows:
+        review_id = str(review.get("review_id") or "")
+        if review_id and review_id in seen_review_ids:
+            continue
+        if review_id:
+            seen_review_ids.add(review_id)
+        row = dict(review)
+        row["seq"] = str(len(output_rows) + 1)
+        output_rows.append(row)
+        added += 1
+    return added
 
 
 def should_skip_keyword(
@@ -857,19 +878,39 @@ class PageSnapshot:
 
 
 class BrowserSession:
-    def __init__(self, port: int) -> None:
+    def __init__(self, port: int, *, create_new_page: bool = False) -> None:
         self.port = port
         self.ws_url: str | None = None
+        self.target_id: str = ""
+        self.create_new_page = create_new_page
 
     @property
     def http_base(self) -> str:
         return f"http://127.0.0.1:{self.port}"
+
+    def _open_new_page_target(self) -> bool:
+        try:
+            payload = requests.put(
+                f"{self.http_base}/json/new?about:blank", timeout=5
+            ).json()
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        ws_url = normalize_space(payload.get("webSocketDebuggerUrl"))
+        if not ws_url:
+            return False
+        self.ws_url = ws_url
+        self.target_id = normalize_space(payload.get("id"))
+        return True
 
     def wait_until_ready(self, timeout_seconds: int = 15) -> None:
         deadline = time.time() + timeout_seconds
         last_error = "Chrome remote debugging not ready"
         while time.time() < deadline:
             try:
+                if self.create_new_page and self._open_new_page_target():
+                    return
                 targets = list_cdp_targets(self.http_base, timeout=5)
                 if not targets:
                     targets = [
@@ -910,6 +951,16 @@ class BrowserSession:
                 + (f": {details}" if details else "")
             )
         raise RuntimeError(last_error)
+
+    def close(self) -> None:
+        if not self.target_id:
+            return
+        try:
+            requests.get(f"{self.http_base}/json/close/{self.target_id}", timeout=2)
+        except Exception:
+            pass
+        finally:
+            self.target_id = ""
 
     def send(
         self, method: str, params: dict[str, Any] | None = None, *, timeout: int = 30
@@ -1314,6 +1365,59 @@ def _collect_single_combo(
     return new_count, stop_reason
 
 
+def reserve_parallel_browser_sessions(port: int, count: int) -> list[BrowserSession]:
+    sessions: list[BrowserSession] = []
+    try:
+        for _ in range(max(count, 0)):
+            browser = BrowserSession(port, create_new_page=True)
+            browser.wait_until_ready()
+            sessions.append(browser)
+        return sessions
+    except Exception:
+        for browser in sessions:
+            browser.close()
+        raise
+
+
+def _collect_combo_job(
+    *,
+    port: int,
+    combo_url: str,
+    combo_name: str,
+    max_pages: int,
+    resume_from_page: int,
+    host: str,
+    asin: str,
+    deadline_monotonic: float | None,
+    browser: BrowserSession | None = None,
+) -> dict[str, Any]:
+    active_browser = browser or BrowserSession(port, create_new_page=True)
+    rows: list[dict[str, Any]] = []
+    try:
+        if browser is None:
+            active_browser.wait_until_ready()
+        raw_new_count, stop_reason = _collect_single_combo(
+            active_browser,
+            combo_url,
+            combo_name,
+            max_pages=max_pages,
+            resume_from_page=resume_from_page,
+            host=host,
+            asin=asin,
+            seen_review_ids=set(),
+            all_rows=rows,
+            deadline_monotonic=deadline_monotonic,
+        )
+        return {
+            "combo": combo_name,
+            "rows": rows,
+            "raw_new_count": raw_new_count,
+            "stop_reason": stop_reason,
+        }
+    finally:
+        active_browser.close()
+
+
 def collect_reviews(
     url: str,
     *,
@@ -1331,6 +1435,7 @@ def collect_reviews(
     keyword_tuning_state_path: Path | None = None,
     combo_delay_seconds: float = DEFAULT_COMBO_DELAY_SECONDS,
     time_budget_minutes: float = DEFAULT_TIME_BUDGET_MINUTES,
+    combo_concurrency: int = DEFAULT_COMBO_CONCURRENCY,
 ) -> dict[str, Any]:
     asin, host = parse_product_url(url)
     review_url = build_review_url(host, asin)
@@ -1380,8 +1485,6 @@ def collect_reviews(
     job_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     create_job(conn, job_id, host, asin, url)
 
-    browser = BrowserSession(port)
-    browser.wait_until_ready()
     tuning_state = load_keyword_tuning_state(keyword_tuning_state_path)
 
     # Select combo strategy
@@ -1413,41 +1516,117 @@ def collect_reviews(
         print(f"缓存已有 {cached_count} 条评论，本次只采集新增的")
     if deadline_monotonic is not None:
         print(f"时间预算: {time_budget_minutes:g} 分钟")
+    print(f"combo 并发: {max(combo_concurrency, 1)}")
 
     # Phase 1: Star/sort combos
-    for combo_name, combo_params in combos:
+    combo_jobs = list(combos)
+    combo_batch_size = max(1, int(combo_concurrency))
+    for batch_start in range(0, len(combo_jobs), combo_batch_size):
         if time_budget_reached(deadline_monotonic):
             stopped_early = True
             stop_reason = "time_budget_reached_before_combo"
             print("时间预算已耗尽，停止启动新的筛选组合")
             break
-        combo_url = f"https://{host}/product-reviews/{asin}/ref=cm_cr_dp_d_show_all_btm?ie=UTF8&{combo_params}"
-        new_count, combo_stop_reason = _collect_single_combo(
-            browser,
-            combo_url,
-            combo_name,
-            max_pages=max_pages,
-            resume_from_page=resume_from,
-            host=host,
-            asin=asin,
-            seen_review_ids=seen_review_ids,
-            all_rows=all_rows,
-            deadline_monotonic=deadline_monotonic,
-        )
-        stats.append(
-            {
-                "combo": combo_name,
-                "new": new_count,
-                "total": len(all_rows),
-            }
-        )
-        combo_completed_count += 1
-        if combo_stop_reason:
-            stopped_early = True
-            stop_reason = combo_stop_reason
+        batch = combo_jobs[batch_start : batch_start + combo_batch_size]
+        batch_results: list[tuple[int, dict[str, Any]]] = []
+        if len(batch) == 1:
+            combo_name, combo_params = batch[0]
+            combo_url = f"https://{host}/product-reviews/{asin}/ref=cm_cr_dp_d_show_all_btm?ie=UTF8&{combo_params}"
+            try:
+                batch_results.append(
+                    (
+                        batch_start,
+                        _collect_combo_job(
+                            port=port,
+                            combo_url=combo_url,
+                            combo_name=combo_name,
+                            max_pages=max_pages,
+                            resume_from_page=resume_from,
+                            host=host,
+                            asin=asin,
+                            deadline_monotonic=deadline_monotonic,
+                        ),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                batch_results.append(
+                    (
+                        batch_start,
+                        {
+                            "combo": combo_name,
+                            "rows": [],
+                            "raw_new_count": 0,
+                            "stop_reason": "",
+                            "error": str(exc),
+                        },
+                    )
+                )
+        else:
+            prepared_sessions = reserve_parallel_browser_sessions(port, len(batch))
+            with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                futures = []
+                for offset, ((combo_name, combo_params), browser_session) in enumerate(
+                    zip(batch, prepared_sessions, strict=False)
+                ):
+                    combo_url = f"https://{host}/product-reviews/{asin}/ref=cm_cr_dp_d_show_all_btm?ie=UTF8&{combo_params}"
+                    futures.append(
+                        (
+                            batch_start + offset,
+                            executor.submit(
+                                _collect_combo_job,
+                                port=port,
+                                combo_url=combo_url,
+                                combo_name=combo_name,
+                                max_pages=max_pages,
+                                resume_from_page=resume_from,
+                                host=host,
+                                asin=asin,
+                                deadline_monotonic=deadline_monotonic,
+                                browser=browser_session,
+                            ),
+                        )
+                    )
+                for combo_index, future in futures:
+                    try:
+                        batch_results.append((combo_index, future.result()))
+                    except Exception as exc:  # noqa: BLE001
+                        combo_name = batch[combo_index - batch_start][0]
+                        batch_results.append(
+                            (
+                                combo_index,
+                                {
+                                    "combo": combo_name,
+                                    "rows": [],
+                                    "raw_new_count": 0,
+                                    "stop_reason": "",
+                                    "error": str(exc),
+                                },
+                            )
+                        )
+
+        batch_results.sort(key=lambda item: item[0])
+        for _, result in batch_results:
+            unique_added = merge_combo_rows(all_rows, seen_review_ids, result["rows"])
+            if result.get("error"):
+                print(f"[{result['combo']}] worker_failed={result['error']}")
+            stats.append(
+                {
+                    "combo": result["combo"],
+                    "new": unique_added,
+                    "raw_new": result["raw_new_count"],
+                    "error": result.get("error", ""),
+                    "total": len(all_rows),
+                }
+            )
+            combo_completed_count += 1
+            if result["stop_reason"] and not stop_reason:
+                stopped_early = True
+                stop_reason = result["stop_reason"]
+
+        if stop_reason:
             break
         if combo_delay_seconds > 0 and (
-            combo_name != combos[-1][0] or planned_keywords
+            batch_start + combo_batch_size < len(combo_jobs) or planned_keywords
         ):
             sleep_with_time_budget(combo_delay_seconds, deadline_monotonic)
             if time_budget_reached(deadline_monotonic):
@@ -1466,76 +1645,79 @@ def collect_reviews(
     consecutive_zero_keywords = 0
 
     if not stopped_early:
-        for kw in planned_keywords:
-            if time_budget_reached(deadline_monotonic):
-                stopped_early = True
-                stop_reason = "time_budget_reached_before_keyword"
-                print("时间预算已耗尽，停止启动新的关键词")
-                break
-            should_skip, reason = should_skip_keyword(
-                keyword_history.get(kw),
-                reuse_scope=keyword_reuse_scope,
-                zero_result_retry_hours=zero_result_retry_hours,
-            )
-            if should_skip:
-                skipped_keywords += 1
-                if reason == "successful_history":
-                    skipped_successful_keywords += 1
-                elif reason == "recent_zero_history":
-                    skipped_recent_zero_keywords += 1
-                continue
-
-            kw_name = kw.replace(" ", "_")
-            kw_params = f"filterByStar=all_stars&reviewerType=all_reviews&sortBy=recent&filterByKeyword={quote(kw)}"
-            combo_url = f"https://{host}/product-reviews/{asin}/ref=cm_cr_dp_d_show_all_btm?ie=UTF8&{kw_params}"
-            new_count, keyword_stop_reason = _collect_single_combo(
-                browser,
-                combo_url,
-                f"kw_{kw_name}",
-                max_pages=max_pages,
-                resume_from_page=resume_from,
-                host=host,
-                asin=asin,
-                seen_review_ids=seen_review_ids,
-                all_rows=all_rows,
-                deadline_monotonic=deadline_monotonic,
-            )
-            stats.append(
-                {
-                    "combo": f"kw_{kw_name}",
-                    "keyword": kw,
-                    "new": new_count,
-                    "total": len(all_rows),
-                }
-            )
-            keyword_completed_count += 1
-            # Record keyword search in history
-            record_keyword_search(conn, host, asin, kw, job_id, new_count, len(all_rows))
-            if keyword_stop_reason:
-                stopped_early = True
-                stop_reason = keyword_stop_reason
-                break
-
-            # Smart early termination:
-            # - If no new reviews from last 3 keywords, stop
-            # - If we have 500+ reviews, stop
-            if new_count == 0:
-                consecutive_zero_keywords += 1
-            else:
-                consecutive_zero_keywords = 0
-            if len(all_rows) >= 500:
-                print(f"已达到 500+ 条评论，停止关键词搜索")
-                break
-            if consecutive_zero_keywords >= 3:
-                print("连续 3 个关键词没有新增评论，停止关键词搜索")
-                break
-            if combo_delay_seconds > 0 and kw != planned_keywords[-1]:
-                sleep_with_time_budget(combo_delay_seconds, deadline_monotonic)
+        keyword_browser = BrowserSession(port)
+        try:
+            keyword_browser.wait_until_ready()
+            for kw in planned_keywords:
                 if time_budget_reached(deadline_monotonic):
                     stopped_early = True
-                    stop_reason = "time_budget_reached_between_keywords"
-                    print("时间预算已耗尽，停止后续关键词")
+                    stop_reason = "time_budget_reached_before_keyword"
+                    print("时间预算已耗尽，停止启动新的关键词")
                     break
+                should_skip, reason = should_skip_keyword(
+                    keyword_history.get(kw),
+                    reuse_scope=keyword_reuse_scope,
+                    zero_result_retry_hours=zero_result_retry_hours,
+                )
+                if should_skip:
+                    skipped_keywords += 1
+                    if reason == "successful_history":
+                        skipped_successful_keywords += 1
+                    elif reason == "recent_zero_history":
+                        skipped_recent_zero_keywords += 1
+                    continue
+
+                kw_name = kw.replace(" ", "_")
+                kw_params = f"filterByStar=all_stars&reviewerType=all_reviews&sortBy=recent&filterByKeyword={quote(kw)}"
+                combo_url = f"https://{host}/product-reviews/{asin}/ref=cm_cr_dp_d_show_all_btm?ie=UTF8&{kw_params}"
+                new_count, keyword_stop_reason = _collect_single_combo(
+                    keyword_browser,
+                    combo_url,
+                    f"kw_{kw_name}",
+                    max_pages=max_pages,
+                    resume_from_page=resume_from,
+                    host=host,
+                    asin=asin,
+                    seen_review_ids=seen_review_ids,
+                    all_rows=all_rows,
+                    deadline_monotonic=deadline_monotonic,
+                )
+                stats.append(
+                    {
+                        "combo": f"kw_{kw_name}",
+                        "keyword": kw,
+                        "new": new_count,
+                        "total": len(all_rows),
+                    }
+                )
+                keyword_completed_count += 1
+                record_keyword_search(
+                    conn, host, asin, kw, job_id, new_count, len(all_rows)
+                )
+                if keyword_stop_reason:
+                    stopped_early = True
+                    stop_reason = keyword_stop_reason
+                    break
+
+                if new_count == 0:
+                    consecutive_zero_keywords += 1
+                else:
+                    consecutive_zero_keywords = 0
+                if len(all_rows) >= 500:
+                    print(f"已达到 500+ 条评论，停止关键词搜索")
+                    break
+                if consecutive_zero_keywords >= 3:
+                    print("连续 3 个关键词没有新增评论，停止关键词搜索")
+                    break
+                if combo_delay_seconds > 0 and kw != planned_keywords[-1]:
+                    sleep_with_time_budget(combo_delay_seconds, deadline_monotonic)
+                    if time_budget_reached(deadline_monotonic):
+                        stopped_early = True
+                        stop_reason = "time_budget_reached_between_keywords"
+                        print("时间预算已耗尽，停止后续关键词")
+                        break
+        finally:
+            keyword_browser.close()
 
     if skipped_keywords > 0:
         print(f"跳过 {skipped_keywords} 个已搜索过的关键词")
@@ -1603,6 +1785,7 @@ def collect_reviews(
         "new_in_session": new_in_session,
         "time_budget_minutes": time_budget_minutes,
         "time_budget_seconds": round(max(time_budget_minutes, 0.0) * 60.0, 3),
+        "combo_concurrency": combo_batch_size,
         "elapsed_seconds": elapsed_seconds,
         "stopped_early": stopped_early,
         "stop_reason": stop_reason,
@@ -1918,6 +2101,9 @@ def command_collect(args: argparse.Namespace) -> int:
         time_budget_minutes=getattr(
             args, "time_budget_minutes", DEFAULT_TIME_BUDGET_MINUTES
         ),
+        combo_concurrency=getattr(
+            args, "combo_concurrency", DEFAULT_COMBO_CONCURRENCY
+        ),
     )
     raw_json = build_collect_output_path(output_dir, payload["asin"])
     raw_json.parent.mkdir(parents=True, exist_ok=True)
@@ -1934,6 +2120,7 @@ def command_collect(args: argparse.Namespace) -> int:
                 "keyword_mode": payload.get("keyword_mode", "off"),
                 "keyword_profile": payload.get("keyword_profile", ""),
                 "keyword_tier": payload.get("keyword_tier", ""),
+                "combo_concurrency": payload.get("combo_concurrency", 1),
                 "elapsed_seconds": payload.get("elapsed_seconds", 0),
                 "stopped_early": payload.get("stopped_early", False),
                 "stop_reason": payload.get("stop_reason", ""),
@@ -1973,6 +2160,9 @@ def command_intake(args: argparse.Namespace) -> int:
         combo_delay_seconds=getattr(args, "combo_delay", DEFAULT_COMBO_DELAY_SECONDS),
         time_budget_minutes=getattr(
             args, "time_budget_minutes", DEFAULT_TIME_BUDGET_MINUTES
+        ),
+        combo_concurrency=getattr(
+            args, "combo_concurrency", DEFAULT_COMBO_CONCURRENCY
         ),
     )
     raw_json = build_collect_output_path(output_dir, payload["asin"])
@@ -2287,6 +2477,9 @@ def command_batch_intake(args: argparse.Namespace) -> int:
                 time_budget_minutes=getattr(
                     args, "time_budget_minutes", DEFAULT_TIME_BUDGET_MINUTES
                 ),
+                combo_concurrency=getattr(
+                    args, "combo_concurrency", DEFAULT_COMBO_CONCURRENCY
+                ),
             )
             raw_json = build_collect_output_path(output_dir, payload["asin"])
             factual_json, factual_xlsx, factual_csv = build_factual_output_paths(
@@ -2463,6 +2656,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TIME_BUDGET_MINUTES,
         help="Optional soft time budget. Stop starting new combos/keywords/pages after this many minutes; 0 disables the cap.",
     )
+    collect.add_argument(
+        "--combo-concurrency",
+        type=int,
+        default=DEFAULT_COMBO_CONCURRENCY,
+        help="How many combo tabs to run in parallel in the same browser session. Default: 3",
+    )
 
     intake = subparsers.add_parser(
         "intake",
@@ -2538,6 +2737,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_TIME_BUDGET_MINUTES,
         help="Optional soft time budget. Stop starting new combos/keywords/pages after this many minutes; 0 disables the cap.",
+    )
+    intake.add_argument(
+        "--combo-concurrency",
+        type=int,
+        default=DEFAULT_COMBO_CONCURRENCY,
+        help="How many combo tabs to run in parallel in the same browser session. Default: 3",
     )
 
     translate = subparsers.add_parser(
@@ -2694,6 +2899,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_TIME_BUDGET_MINUTES,
         help="Optional soft time budget. Stop starting new combos/keywords/pages after this many minutes; 0 disables the cap.",
+    )
+    batch.add_argument(
+        "--combo-concurrency",
+        type=int,
+        default=DEFAULT_COMBO_CONCURRENCY,
+        help="How many combo tabs to run in parallel in the same browser session. Default: 3",
     )
 
     summary = subparsers.add_parser(
