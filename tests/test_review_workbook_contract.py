@@ -16,6 +16,7 @@ from amazon_review_workbook import (
     build_keyword_tuning_state,
     build_keyword_profile,
     extract_page_totals,
+    probe_cdp_endpoint,
     remaining_time_budget_seconds,
     resolve_keyword_plan,
     score_keyword_stats,
@@ -220,6 +221,65 @@ class ReviewWorkbookContractTests(unittest.TestCase):
         finally:
             workbook.time.sleep = original_sleep
             workbook.time.monotonic = original_monotonic
+
+    def test_probe_cdp_endpoint_accepts_devtools_version_payload(self) -> None:
+        import amazon_review_workbook as workbook
+
+        class FakeResponse:
+            def __init__(self, payload: object, status_code: int = 200) -> None:
+                self._payload = payload
+                self.status_code = status_code
+                self.text = '{"Browser":"Chrome/123"}'
+
+            def json(self) -> object:
+                return self._payload
+
+        original_port_is_open = workbook.port_is_open
+        original_get = workbook.requests.get
+        try:
+            workbook.port_is_open = lambda host, port: True
+            workbook.requests.get = (
+                lambda url, timeout=5: FakeResponse(
+                    {
+                        "Browser": "Chrome/123.0",
+                        "webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/abc",
+                    }
+                )
+            )
+            probe = probe_cdp_endpoint("127.0.0.1", 9222)
+            self.assertTrue(probe["chrome_debug_ready"])
+            self.assertEqual(probe["cdp_http_status"], 200)
+            self.assertEqual(probe["cdp_browser"], "Chrome/123.0")
+            self.assertEqual(
+                probe["cdp_websocket_url"], "ws://127.0.0.1/devtools/browser/abc"
+            )
+        finally:
+            workbook.port_is_open = original_port_is_open
+            workbook.requests.get = original_get
+
+    def test_probe_cdp_endpoint_rejects_non_json_fake_positive(self) -> None:
+        import amazon_review_workbook as workbook
+
+        class FakeResponse:
+            def __init__(self, status_code: int = 404, text: str = "Not Found") -> None:
+                self.status_code = status_code
+                self.text = text
+
+            def json(self) -> object:
+                raise ValueError("not json")
+
+        original_port_is_open = workbook.port_is_open
+        original_get = workbook.requests.get
+        try:
+            workbook.port_is_open = lambda host, port: True
+            workbook.requests.get = lambda url, timeout=5: FakeResponse()
+            probe = probe_cdp_endpoint("127.0.0.1", 9222)
+            self.assertFalse(probe["chrome_debug_ready"])
+            self.assertEqual(probe["cdp_http_status"], 404)
+            self.assertIn("non_json_response", probe["cdp_probe_error"])
+        finally:
+            workbook.port_is_open = original_port_is_open
+            workbook.requests.get = original_get
 
 
 if __name__ == "__main__":

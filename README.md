@@ -62,6 +62,8 @@ DEEPLX_API_KEY=your-optional-key
 python scripts/amazon_review_workbook.py doctor --url "<amazon-url>"
 ```
 
+`doctor` 现在不只看 9222 端口是否打开，还会校验它是不是一个真正的 DevTools JSON 端点，避免“端口在监听但不是 CDP”这种假阳性。
+
 ### 抓取事实工作簿
 
 ```bash

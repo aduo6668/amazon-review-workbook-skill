@@ -747,6 +747,107 @@ def port_is_open(host: str, port: int) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
+def _looks_like_cdp_version_payload(payload: Any) -> bool:
+    return isinstance(payload, dict) and bool(
+        normalize_space(payload.get("Browser"))
+        or normalize_space(payload.get("webSocketDebuggerUrl"))
+    )
+
+
+def _looks_like_cdp_target_list(payload: Any) -> bool:
+    return isinstance(payload, list) and all(isinstance(item, dict) for item in payload)
+
+
+def probe_cdp_endpoint(host: str, port: int, *, timeout: float = 5) -> dict[str, Any]:
+    base = f"http://{host}:{port}"
+    result: dict[str, Any] = {
+        "chrome_debug_ready": False,
+        "cdp_port": port,
+        "cdp_probe_url": "",
+        "cdp_http_status": None,
+        "cdp_probe_error": "",
+        "cdp_browser": "",
+        "cdp_websocket_url": "",
+        "cdp_target_count": 0,
+    }
+    if not port_is_open(host, port):
+        result["cdp_probe_error"] = "port_closed"
+        return result
+
+    probe_paths = ("/json/version", "/json/list", "/json")
+    last_error = ""
+    for path in probe_paths:
+        url = f"{base}{path}"
+        result["cdp_probe_url"] = url
+        try:
+            response = requests.get(url, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            result["cdp_probe_error"] = last_error
+            continue
+
+        result["cdp_http_status"] = response.status_code
+        try:
+            payload = response.json()
+        except ValueError:
+            snippet = normalize_space(response.text)[:120]
+            last_error = (
+                f"non_json_response status={response.status_code}"
+                + (f" body={snippet}" if snippet else "")
+            )
+            result["cdp_probe_error"] = last_error
+            continue
+
+        if _looks_like_cdp_version_payload(payload):
+            result["chrome_debug_ready"] = True
+            result["cdp_browser"] = normalize_space(payload.get("Browser"))
+            result["cdp_websocket_url"] = normalize_space(
+                payload.get("webSocketDebuggerUrl")
+            )
+            return result
+
+        if _looks_like_cdp_target_list(payload):
+            result["cdp_target_count"] = len(payload)
+            pages = [
+                item
+                for item in payload
+                if item.get("type") == "page" and item.get("webSocketDebuggerUrl")
+            ]
+            if pages:
+                result["chrome_debug_ready"] = True
+                result["cdp_websocket_url"] = normalize_space(
+                    pages[0].get("webSocketDebuggerUrl")
+                )
+                return result
+            last_error = "no_page_targets"
+            result["cdp_probe_error"] = last_error
+            continue
+
+        last_error = f"unexpected_payload_type={type(payload).__name__}"
+        result["cdp_probe_error"] = last_error
+
+    if not result["cdp_probe_error"]:
+        result["cdp_probe_error"] = last_error or "cdp_probe_failed"
+    return result
+
+
+def list_cdp_targets(http_base: str, *, timeout: float = 5) -> list[dict[str, Any]]:
+    last_error = "no_cdp_targets"
+    for path in ("/json/list", "/json"):
+        url = f"{http_base}{path}"
+        try:
+            response = requests.get(url, timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            continue
+        if _looks_like_cdp_target_list(payload):
+            return payload
+        last_error = f"unexpected_payload_type={type(payload).__name__}"
+    raise RuntimeError(last_error)
+
+
 @dataclass
 class PageSnapshot:
     href: str
@@ -769,7 +870,7 @@ class BrowserSession:
         last_error = "Chrome remote debugging not ready"
         while time.time() < deadline:
             try:
-                targets = requests.get(f"{self.http_base}/json", timeout=5).json()
+                targets = list_cdp_targets(self.http_base, timeout=5)
                 if not targets:
                     targets = [
                         requests.put(
@@ -788,6 +889,26 @@ class BrowserSession:
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)
             time.sleep(1)
+        probe = probe_cdp_endpoint("127.0.0.1", self.port, timeout=3)
+        if not probe.get("chrome_debug_ready"):
+            probe_error = normalize_space(probe.get("cdp_probe_error"))
+            http_status = probe.get("cdp_http_status")
+            probe_url = normalize_space(probe.get("cdp_probe_url"))
+            details = ", ".join(
+                [
+                    part
+                    for part in (
+                        f"http_status={http_status}" if http_status is not None else "",
+                        f"probe_url={probe_url}" if probe_url else "",
+                        f"probe_error={probe_error}" if probe_error else "",
+                    )
+                    if part
+                ]
+            )
+            raise RuntimeError(
+                "Chrome remote debugging endpoint is not ready"
+                + (f": {details}" if details else "")
+            )
         raise RuntimeError(last_error)
 
     def send(
@@ -1619,6 +1740,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     asin, host = parse_product_url(args.url)
     api_url = args.api_url or read_env_value("DEEPLX_API_URL") or ""
     api_key = args.api_key or read_env_value("DEEPLX_API_KEY") or ""
+    cdp_probe = probe_cdp_endpoint("127.0.0.1", args.cdp_port)
     deeplx_ready = False
     deeplx_probe = "missing_api_url"
     if api_url:
@@ -1631,10 +1753,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     )
     print(
         json.dumps(
-            {
-                "chrome_debug_ready": port_is_open("127.0.0.1", args.cdp_port),
-                "cdp_port": args.cdp_port,
-            },
+            cdp_probe,
             ensure_ascii=False,
         )
     )
@@ -1692,7 +1811,8 @@ def command_coverage_check(args: argparse.Namespace) -> int:
     if args.input_json:
         input_count = len(load_layered_records(Path(args.input_json).expanduser()))
 
-    chrome_debug_ready = port_is_open("127.0.0.1", args.cdp_port)
+    cdp_probe = probe_cdp_endpoint("127.0.0.1", args.cdp_port)
+    chrome_debug_ready = bool(cdp_probe.get("chrome_debug_ready"))
     page_probe: dict[str, Any] = {
         "page_total_reviews": None,
         "page_total_reviews_evidence": "",
@@ -1720,6 +1840,7 @@ def command_coverage_check(args: argparse.Namespace) -> int:
                 "host": host,
                 "review_url": review_url,
                 "chrome_debug_ready": chrome_debug_ready,
+                **cdp_probe,
                 "current_count": current_count,
                 "current_count_source": "input_json" if input_count else "cache_db",
                 "cache_db_count": cached_count,

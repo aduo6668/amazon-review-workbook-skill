@@ -56,7 +56,7 @@ python scripts/amazon_review_workbook.py merge-build --base-json "<workspace>/am
 ### 1. Verify prerequisites
 
 - Confirm `doctor` reports a valid `asin`.
-- Confirm `chrome_debug_ready` is `true`.
+- Confirm `chrome_debug_ready` is `true`. `doctor` now validates a real DevTools JSON endpoint, not just an open port.
 - If you plan to use `translate`, confirm `deeplx_env_ready` is `true`.
 - If `deeplx_reachable` is `false`, do not block the workflow; let the model fill `评论中文版` during tagging.
 
