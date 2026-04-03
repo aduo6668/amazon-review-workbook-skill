@@ -119,39 +119,51 @@ FAST_KEYWORDS: list[str] = []
 # - electronics: common hardware/app/setup issues
 # - dashcam: scenario-specific terms from our core delivery context
 KEYWORD_LIBRARY = {
-    "universal": [
-        "quality",
-        "problem",
-        "broken",
-        "refund",
-        "return",
-        "support",
-        "durable",
-        "price",
-        "worth",
-        "packaging",
-        "recommend",
-    ],
-    "electronics": [
-        "app",
-        "setup",
-        "install",
-        "battery",
-        "cable",
-        "screen",
-        "update",
-        "firmware",
-    ],
-    "dashcam": [
-        "video",
-        "night",
-        "parking",
-        "gps",
-        "wifi",
-        "recording",
-        "mount",
-        "rear camera",
-    ],
+    "universal": {
+        "core": [
+            "quality",
+            "problem",
+            "broken",
+            "refund",
+            "support",
+            "durable",
+        ],
+        "explore": [
+            "return",
+            "price",
+            "worth",
+            "packaging",
+            "recommend",
+        ],
+    },
+    "electronics": {
+        "core": [
+            "app",
+            "setup",
+            "install",
+            "battery",
+            "cable",
+        ],
+        "explore": [
+            "screen",
+            "update",
+            "firmware",
+        ],
+    },
+    "dashcam": {
+        "core": [
+            "video",
+            "night",
+            "parking",
+            "recording",
+            "mount",
+        ],
+        "explore": [
+            "gps",
+            "wifi",
+            "rear camera",
+        ],
+    },
 }
 
 KEYWORD_PROFILES = {
@@ -161,6 +173,8 @@ KEYWORD_PROFILES = {
 }
 
 DEFAULT_KEYWORD_PROFILE = "electronics"
+KEYWORD_TIERS = ("core", "explore", "all")
+DEFAULT_KEYWORD_TIER = "all"
 
 DEFAULT_MAX_PAGES = 10
 DEFAULT_CDP_PORT = 9222
@@ -168,6 +182,7 @@ DEFAULT_COMBO_DELAY_SECONDS = 2.5
 DEFAULT_KEYWORD_REUSE_SCOPE = "successful"
 DEFAULT_ZERO_RESULT_RETRY_HOURS = 72.0
 DEFAULT_KEYWORD_TUNING_TOP_K = 12
+DEFAULT_TIME_BUDGET_MINUTES = 0.0
 
 logger = logging.getLogger("amazon_review_workbook")
 
@@ -320,11 +335,27 @@ def dedupe_preserve_order(items: list[str]) -> list[str]:
     return result
 
 
-def build_keyword_profile(profile: str) -> list[str]:
+def normalize_keyword_tier(tier: str) -> str:
+    value = normalize_space(tier).lower()
+    return value if value in KEYWORD_TIERS else DEFAULT_KEYWORD_TIER
+
+
+def build_keyword_profile(
+    profile: str, *, tier: str = DEFAULT_KEYWORD_TIER
+) -> list[str]:
     layers = KEYWORD_PROFILES.get(profile, KEYWORD_PROFILES[DEFAULT_KEYWORD_PROFILE])
+    normalized_tier = normalize_keyword_tier(tier)
+    ordered_layers = (
+        list(reversed(layers)) if normalized_tier == "explore" else list(layers)
+    )
     combined: list[str] = []
-    for layer in layers:
-        combined.extend(KEYWORD_LIBRARY.get(layer, []))
+    for layer in ordered_layers:
+        layer_groups = KEYWORD_LIBRARY.get(layer, {})
+        if normalized_tier == "all":
+            combined.extend(layer_groups.get("core", []))
+            combined.extend(layer_groups.get("explore", []))
+        else:
+            combined.extend(layer_groups.get(normalized_tier, []))
     return dedupe_preserve_order(combined)
 
 
@@ -355,9 +386,10 @@ def build_recommended_keywords_from_stats(
     profile: str,
     keyword_stats: dict[str, dict[str, Any]],
     *,
+    tier: str = DEFAULT_KEYWORD_TIER,
     top_k: int = DEFAULT_KEYWORD_TUNING_TOP_K,
 ) -> list[str]:
-    base_keywords = build_keyword_profile(profile)
+    base_keywords = build_keyword_profile(profile, tier=tier)
     ranked: list[tuple[float, int, int, str]] = []
     for base_index, keyword in enumerate(base_keywords):
         stats = keyword_stats.get(keyword, {})
@@ -380,18 +412,25 @@ def get_tuned_keywords(
     profile: str,
     *,
     tuning_state: dict[str, Any],
+    tier: str = DEFAULT_KEYWORD_TIER,
     top_k: int = DEFAULT_KEYWORD_TUNING_TOP_K,
 ) -> list[str]:
+    normalized_tier = normalize_keyword_tier(tier)
     profile_payload = (tuning_state.get("profiles") or {}).get(profile)
     if not isinstance(profile_payload, dict):
-        return build_keyword_profile(profile)[:top_k]
-    keywords = profile_payload.get("recommended_keywords") or []
+        return build_keyword_profile(profile, tier=normalized_tier)[:top_k]
+    keywords_by_tier = profile_payload.get("recommended_keywords_by_tier") or {}
+    keywords = []
+    if isinstance(keywords_by_tier, dict):
+        keywords = keywords_by_tier.get(normalized_tier) or []
+    if not keywords and normalized_tier == "all":
+        keywords = profile_payload.get("recommended_keywords") or []
     cleaned = dedupe_preserve_order(
         [normalize_space(item) for item in keywords if normalize_space(item)]
     )
     if cleaned:
         return cleaned[:top_k] if top_k > 0 else cleaned
-    return build_keyword_profile(profile)[:top_k]
+    return build_keyword_profile(profile, tier=normalized_tier)[:top_k]
 
 
 def resolve_keyword_plan(
@@ -399,6 +438,7 @@ def resolve_keyword_plan(
     keyword_profile: str,
     *,
     tuning_state: dict[str, Any] | None = None,
+    keyword_tier: str = DEFAULT_KEYWORD_TIER,
     top_k: int = DEFAULT_KEYWORD_TUNING_TOP_K,
 ) -> tuple[list[str], str]:
     if keywords is None:
@@ -408,10 +448,16 @@ def resolve_keyword_plan(
     )
     if cleaned:
         return cleaned, "custom"
+    normalized_tier = normalize_keyword_tier(keyword_tier)
     tuned = get_tuned_keywords(
-        keyword_profile, tuning_state=tuning_state or {}, top_k=top_k
+        keyword_profile,
+        tuning_state=tuning_state or {},
+        tier=normalized_tier,
+        top_k=top_k,
     )
-    return tuned, f"profile:{keyword_profile}:tuned"
+    if normalized_tier == "all":
+        return tuned, f"profile:{keyword_profile}:tuned"
+    return tuned, f"profile:{keyword_profile}:{normalized_tier}:tuned"
 
 
 def parse_utc_timestamp(value: Any) -> datetime | None:
@@ -424,6 +470,42 @@ def parse_utc_timestamp(value: Any) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+def build_time_budget_deadline(
+    time_budget_minutes: float, *, now_monotonic: float | None = None
+) -> float | None:
+    if time_budget_minutes <= 0:
+        return None
+    start = time.monotonic() if now_monotonic is None else now_monotonic
+    return start + max(time_budget_minutes * 60.0, 0.0)
+
+
+def remaining_time_budget_seconds(
+    deadline_monotonic: float | None, *, now_monotonic: float | None = None
+) -> float:
+    if deadline_monotonic is None:
+        return float("inf")
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    return max(deadline_monotonic - now, 0.0)
+
+
+def time_budget_reached(
+    deadline_monotonic: float | None, *, now_monotonic: float | None = None
+) -> bool:
+    if deadline_monotonic is None:
+        return False
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    return now >= deadline_monotonic
+
+
+def sleep_with_time_budget(seconds: float, deadline_monotonic: float | None) -> None:
+    if seconds <= 0:
+        return
+    remaining = remaining_time_budget_seconds(deadline_monotonic)
+    if remaining <= 0:
+        return
+    time.sleep(min(seconds, remaining))
 
 
 def should_skip_keyword(
@@ -568,12 +650,20 @@ def build_keyword_tuning_state(
 ) -> dict[str, Any]:
     profiles: dict[str, Any] = {}
     for profile in sorted(KEYWORD_PROFILES):
-        recommended = build_recommended_keywords_from_stats(
-            profile, keyword_stats, top_k=top_k
-        )
+        recommended_by_tier = {
+            tier: build_recommended_keywords_from_stats(
+                profile, keyword_stats, tier=tier, top_k=top_k
+            )
+            for tier in KEYWORD_TIERS
+        }
         profiles[profile] = {
-            "recommended_keywords": recommended,
+            "recommended_keywords": recommended_by_tier["all"],
+            "recommended_keywords_by_tier": recommended_by_tier,
             "base_keywords": build_keyword_profile(profile),
+            "base_keywords_by_tier": {
+                tier: build_keyword_profile(profile, tier=tier)
+                for tier in KEYWORD_TIERS
+            },
         }
     global_top = sorted(
         keyword_stats.values(),
@@ -1002,8 +1092,11 @@ def _collect_single_combo(
     asin: str,
     seen_review_ids: set[str],
     all_rows: list[dict[str, Any]],
-) -> int:
+    deadline_monotonic: float | None = None,
+) -> tuple[int, str]:
     """Collect reviews from a single filter/sort combo. Returns new review count."""
+    if time_budget_reached(deadline_monotonic):
+        return 0, "time_budget_reached_before_combo"
     browser.navigate(combo_url)
     time.sleep(4)
     _enforce_notranslate(browser)
@@ -1014,7 +1107,7 @@ def _collect_single_combo(
         for blocked in ("robot check", "captcha", "sorry", "problem loading")
     ):
         print(f"[{combo_name}] 阻断页面，跳过")
-        return 0
+        return 0, ""
 
     pages: list[dict[str, Any]] = []
     seen_signatures: set[tuple[str, str, int]] = set()
@@ -1022,18 +1115,25 @@ def _collect_single_combo(
 
     if not current.reviews:
         print(f"[{combo_name}] 未检测到评论，跳过")
-        return 0
+        return 0, ""
 
     pages_to_skip = max(resume_from_page - 1, 0)
     while pages_to_skip > 0:
+        if time_budget_reached(deadline_monotonic):
+            print(f"[{combo_name}] 时间预算已耗尽，停止跳页")
+            return 0, "time_budget_reached_during_resume"
         if not current.next_href or not click_next(browser):
             print(f"[{combo_name}] 无法跳到第 {resume_from_page} 页，提前结束")
-            return 0
+            return 0, ""
         current = wait_for_page_change(browser, current)
         pages_to_skip -= 1
 
     start_page = max(resume_from_page, 1)
+    stop_reason = ""
     for page_no in range(start_page, start_page + max_pages):
+        if time_budget_reached(deadline_monotonic):
+            stop_reason = "time_budget_reached_mid_combo"
+            break
         if not current.reviews:
             break
         first_id = str(current.reviews[0].get("review_id") or "")
@@ -1054,6 +1154,9 @@ def _collect_single_combo(
         )
 
         if not current.next_href:
+            break
+        if time_budget_reached(deadline_monotonic):
+            stop_reason = "time_budget_reached_mid_combo"
             break
         if not click_next(browser):
             break
@@ -1085,7 +1188,9 @@ def _collect_single_combo(
         print(f"[{combo_name}] 新增 {new_count} 条评论（共 {len(pages)} 页）")
     else:
         print(f"[{combo_name}] 无新评论")
-    return new_count
+    if stop_reason:
+        print(f"[{combo_name}] 因时间预算停止后续页面抓取")
+    return new_count, stop_reason
 
 
 def collect_reviews(
@@ -1099,13 +1204,19 @@ def collect_reviews(
     refresh_cache: bool = False,
     keywords: list[str] | None = None,
     keyword_profile: str = DEFAULT_KEYWORD_PROFILE,
+    keyword_tier: str = DEFAULT_KEYWORD_TIER,
     keyword_reuse_scope: str = DEFAULT_KEYWORD_REUSE_SCOPE,
     zero_result_retry_hours: float = DEFAULT_ZERO_RESULT_RETRY_HOURS,
     keyword_tuning_state_path: Path | None = None,
     combo_delay_seconds: float = DEFAULT_COMBO_DELAY_SECONDS,
+    time_budget_minutes: float = DEFAULT_TIME_BUDGET_MINUTES,
 ) -> dict[str, Any]:
     asin, host = parse_product_url(url)
     review_url = build_review_url(host, asin)
+    started_at_monotonic = time.monotonic()
+    deadline_monotonic = build_time_budget_deadline(
+        time_budget_minutes, now_monotonic=started_at_monotonic
+    )
 
     # Setup cache
     if db_path is None:
@@ -1133,7 +1244,13 @@ def collect_reviews(
             "review_url": review_url,
             "mode": mode,
             "combo_count": 0,
+            "combo_completed_count": 0,
             "cached_total": cached_count,
+            "time_budget_minutes": time_budget_minutes,
+            "time_budget_seconds": round(max(time_budget_minutes, 0.0) * 60.0, 3),
+            "elapsed_seconds": round(time.monotonic() - started_at_monotonic, 3),
+            "stopped_early": False,
+            "stop_reason": "",
             "row_count": len(cached_rows),
             "results": cached_rows,
         }
@@ -1157,22 +1274,34 @@ def collect_reviews(
             keywords,
             keyword_profile,
             tuning_state=tuning_state,
+            keyword_tier=keyword_tier,
         )
 
     all_rows: list[dict[str, Any]] = []
     seen_review_ids: set[str] = set(known_ids)
     stats: list[dict[str, Any]] = []
+    stopped_early = False
+    stop_reason = ""
+    combo_completed_count = 0
+    keyword_completed_count = 0
 
     print(
         f"开始采集评论，模式: {mode}，{len(combos)} 个筛选组合 + {len(planned_keywords)} 个关键词"
     )
     if cached_count > 0:
         print(f"缓存已有 {cached_count} 条评论，本次只采集新增的")
+    if deadline_monotonic is not None:
+        print(f"时间预算: {time_budget_minutes:g} 分钟")
 
     # Phase 1: Star/sort combos
     for combo_name, combo_params in combos:
+        if time_budget_reached(deadline_monotonic):
+            stopped_early = True
+            stop_reason = "time_budget_reached_before_combo"
+            print("时间预算已耗尽，停止启动新的筛选组合")
+            break
         combo_url = f"https://{host}/product-reviews/{asin}/ref=cm_cr_dp_d_show_all_btm?ie=UTF8&{combo_params}"
-        new_count = _collect_single_combo(
+        new_count, combo_stop_reason = _collect_single_combo(
             browser,
             combo_url,
             combo_name,
@@ -1182,6 +1311,7 @@ def collect_reviews(
             asin=asin,
             seen_review_ids=seen_review_ids,
             all_rows=all_rows,
+            deadline_monotonic=deadline_monotonic,
         )
         stats.append(
             {
@@ -1190,10 +1320,20 @@ def collect_reviews(
                 "total": len(all_rows),
             }
         )
+        combo_completed_count += 1
+        if combo_stop_reason:
+            stopped_early = True
+            stop_reason = combo_stop_reason
+            break
         if combo_delay_seconds > 0 and (
             combo_name != combos[-1][0] or planned_keywords
         ):
-            time.sleep(combo_delay_seconds)
+            sleep_with_time_budget(combo_delay_seconds, deadline_monotonic)
+            if time_budget_reached(deadline_monotonic):
+                stopped_early = True
+                stop_reason = "time_budget_reached_between_combos"
+                print("时间预算已耗尽，停止后续筛选组合/关键词")
+                break
 
     # Phase 2: Keyword search with history tracking and smart skip
     keyword_history = (
@@ -1204,60 +1344,77 @@ def collect_reviews(
     skipped_recent_zero_keywords = 0
     consecutive_zero_keywords = 0
 
-    for kw in planned_keywords:
-        should_skip, reason = should_skip_keyword(
-            keyword_history.get(kw),
-            reuse_scope=keyword_reuse_scope,
-            zero_result_retry_hours=zero_result_retry_hours,
-        )
-        if should_skip:
-            skipped_keywords += 1
-            if reason == "successful_history":
-                skipped_successful_keywords += 1
-            elif reason == "recent_zero_history":
-                skipped_recent_zero_keywords += 1
-            continue
+    if not stopped_early:
+        for kw in planned_keywords:
+            if time_budget_reached(deadline_monotonic):
+                stopped_early = True
+                stop_reason = "time_budget_reached_before_keyword"
+                print("时间预算已耗尽，停止启动新的关键词")
+                break
+            should_skip, reason = should_skip_keyword(
+                keyword_history.get(kw),
+                reuse_scope=keyword_reuse_scope,
+                zero_result_retry_hours=zero_result_retry_hours,
+            )
+            if should_skip:
+                skipped_keywords += 1
+                if reason == "successful_history":
+                    skipped_successful_keywords += 1
+                elif reason == "recent_zero_history":
+                    skipped_recent_zero_keywords += 1
+                continue
 
-        kw_name = kw.replace(" ", "_")
-        kw_params = f"filterByStar=all_stars&reviewerType=all_reviews&sortBy=recent&filterByKeyword={quote(kw)}"
-        combo_url = f"https://{host}/product-reviews/{asin}/ref=cm_cr_dp_d_show_all_btm?ie=UTF8&{kw_params}"
-        new_count = _collect_single_combo(
-            browser,
-            combo_url,
-            f"kw_{kw_name}",
-            max_pages=max_pages,
-            resume_from_page=resume_from,
-            host=host,
-            asin=asin,
-            seen_review_ids=seen_review_ids,
-            all_rows=all_rows,
-        )
-        stats.append(
-            {
-                "combo": f"kw_{kw_name}",
-                "keyword": kw,
-                "new": new_count,
-                "total": len(all_rows),
-            }
-        )
-        # Record keyword search in history
-        record_keyword_search(conn, host, asin, kw, job_id, new_count, len(all_rows))
+            kw_name = kw.replace(" ", "_")
+            kw_params = f"filterByStar=all_stars&reviewerType=all_reviews&sortBy=recent&filterByKeyword={quote(kw)}"
+            combo_url = f"https://{host}/product-reviews/{asin}/ref=cm_cr_dp_d_show_all_btm?ie=UTF8&{kw_params}"
+            new_count, keyword_stop_reason = _collect_single_combo(
+                browser,
+                combo_url,
+                f"kw_{kw_name}",
+                max_pages=max_pages,
+                resume_from_page=resume_from,
+                host=host,
+                asin=asin,
+                seen_review_ids=seen_review_ids,
+                all_rows=all_rows,
+                deadline_monotonic=deadline_monotonic,
+            )
+            stats.append(
+                {
+                    "combo": f"kw_{kw_name}",
+                    "keyword": kw,
+                    "new": new_count,
+                    "total": len(all_rows),
+                }
+            )
+            keyword_completed_count += 1
+            # Record keyword search in history
+            record_keyword_search(conn, host, asin, kw, job_id, new_count, len(all_rows))
+            if keyword_stop_reason:
+                stopped_early = True
+                stop_reason = keyword_stop_reason
+                break
 
-        # Smart early termination:
-        # - If no new reviews from last 3 keywords, stop
-        # - If we have 500+ reviews, stop
-        if new_count == 0:
-            consecutive_zero_keywords += 1
-        else:
-            consecutive_zero_keywords = 0
-        if len(all_rows) >= 500:
-            print(f"已达到 500+ 条评论，停止关键词搜索")
-            break
-        if consecutive_zero_keywords >= 3:
-            print("连续 3 个关键词没有新增评论，停止关键词搜索")
-            break
-        if combo_delay_seconds > 0 and kw != planned_keywords[-1]:
-            time.sleep(combo_delay_seconds)
+            # Smart early termination:
+            # - If no new reviews from last 3 keywords, stop
+            # - If we have 500+ reviews, stop
+            if new_count == 0:
+                consecutive_zero_keywords += 1
+            else:
+                consecutive_zero_keywords = 0
+            if len(all_rows) >= 500:
+                print(f"已达到 500+ 条评论，停止关键词搜索")
+                break
+            if consecutive_zero_keywords >= 3:
+                print("连续 3 个关键词没有新增评论，停止关键词搜索")
+                break
+            if combo_delay_seconds > 0 and kw != planned_keywords[-1]:
+                sleep_with_time_budget(combo_delay_seconds, deadline_monotonic)
+                if time_budget_reached(deadline_monotonic):
+                    stopped_early = True
+                    stop_reason = "time_budget_reached_between_keywords"
+                    print("时间预算已耗尽，停止后续关键词")
+                    break
 
     if skipped_keywords > 0:
         print(f"跳过 {skipped_keywords} 个已搜索过的关键词")
@@ -1272,6 +1429,7 @@ def collect_reviews(
     new_in_session = len(all_rows)
     upsert_reviews(conn, host, asin, job_id, all_rows)
     final_cached_count = get_cached_review_count(conn, host, asin)
+    elapsed_seconds = round(time.monotonic() - started_at_monotonic, 3)
     finish_job(
         conn,
         job_id,
@@ -1308,9 +1466,12 @@ def collect_reviews(
         "review_url": review_url,
         "mode": mode,
         "combo_count": len(combos),
+        "combo_completed_count": combo_completed_count,
         "keyword_count": len(planned_keywords),
+        "keyword_completed_count": keyword_completed_count,
         "keyword_mode": keyword_mode,
         "keyword_profile": keyword_profile,
+        "keyword_tier": normalize_keyword_tier(keyword_tier),
         "keyword_tuning_state_path": str(keyword_tuning_state_path)
         if keyword_tuning_state_path
         else "",
@@ -1319,6 +1480,11 @@ def collect_reviews(
         "skipped_successful_keywords": skipped_successful_keywords,
         "skipped_recent_zero_keywords": skipped_recent_zero_keywords,
         "new_in_session": new_in_session,
+        "time_budget_minutes": time_budget_minutes,
+        "time_budget_seconds": round(max(time_budget_minutes, 0.0) * 60.0, 3),
+        "elapsed_seconds": elapsed_seconds,
+        "stopped_early": stopped_early,
+        "stop_reason": stop_reason,
         "cached_total": final_cached_count,
         "row_count": len(cached_rows),
         "stats": stats,
@@ -1617,6 +1783,7 @@ def command_collect(args: argparse.Namespace) -> int:
         refresh_cache=getattr(args, "refresh_cache", False),
         keywords=getattr(args, "keywords", None),
         keyword_profile=getattr(args, "keyword_profile", DEFAULT_KEYWORD_PROFILE),
+        keyword_tier=getattr(args, "keyword_tier", DEFAULT_KEYWORD_TIER),
         keyword_reuse_scope=getattr(
             args, "keyword_reuse_scope", DEFAULT_KEYWORD_REUSE_SCOPE
         ),
@@ -1627,6 +1794,9 @@ def command_collect(args: argparse.Namespace) -> int:
         if getattr(args, "keyword_tuning_state", "")
         else default_keyword_tuning_state_path(output_dir),
         combo_delay_seconds=getattr(args, "combo_delay", DEFAULT_COMBO_DELAY_SECONDS),
+        time_budget_minutes=getattr(
+            args, "time_budget_minutes", DEFAULT_TIME_BUDGET_MINUTES
+        ),
     )
     raw_json = build_collect_output_path(output_dir, payload["asin"])
     raw_json.parent.mkdir(parents=True, exist_ok=True)
@@ -1642,6 +1812,10 @@ def command_collect(args: argparse.Namespace) -> int:
                 "keyword_count": payload.get("keyword_count", 0),
                 "keyword_mode": payload.get("keyword_mode", "off"),
                 "keyword_profile": payload.get("keyword_profile", ""),
+                "keyword_tier": payload.get("keyword_tier", ""),
+                "elapsed_seconds": payload.get("elapsed_seconds", 0),
+                "stopped_early": payload.get("stopped_early", False),
+                "stop_reason": payload.get("stop_reason", ""),
                 "skipped_keywords": payload.get("skipped_keywords", 0),
                 "row_count": payload["row_count"],
             },
@@ -1665,6 +1839,7 @@ def command_intake(args: argparse.Namespace) -> int:
         refresh_cache=getattr(args, "refresh_cache", False),
         keywords=getattr(args, "keywords", None),
         keyword_profile=getattr(args, "keyword_profile", DEFAULT_KEYWORD_PROFILE),
+        keyword_tier=getattr(args, "keyword_tier", DEFAULT_KEYWORD_TIER),
         keyword_reuse_scope=getattr(
             args, "keyword_reuse_scope", DEFAULT_KEYWORD_REUSE_SCOPE
         ),
@@ -1675,6 +1850,9 @@ def command_intake(args: argparse.Namespace) -> int:
         if getattr(args, "keyword_tuning_state", "")
         else default_keyword_tuning_state_path(output_dir),
         combo_delay_seconds=getattr(args, "combo_delay", DEFAULT_COMBO_DELAY_SECONDS),
+        time_budget_minutes=getattr(
+            args, "time_budget_minutes", DEFAULT_TIME_BUDGET_MINUTES
+        ),
     )
     raw_json = build_collect_output_path(output_dir, payload["asin"])
     factual_json, factual_xlsx, factual_csv = build_factual_output_paths(
@@ -1970,6 +2148,7 @@ def command_batch_intake(args: argparse.Namespace) -> int:
                 keyword_profile=getattr(
                     args, "keyword_profile", DEFAULT_KEYWORD_PROFILE
                 ),
+                keyword_tier=getattr(args, "keyword_tier", DEFAULT_KEYWORD_TIER),
                 keyword_reuse_scope=getattr(
                     args, "keyword_reuse_scope", DEFAULT_KEYWORD_REUSE_SCOPE
                 ),
@@ -1983,6 +2162,9 @@ def command_batch_intake(args: argparse.Namespace) -> int:
                 else default_keyword_tuning_state_path(output_dir),
                 combo_delay_seconds=getattr(
                     args, "combo_delay", DEFAULT_COMBO_DELAY_SECONDS
+                ),
+                time_budget_minutes=getattr(
+                    args, "time_budget_minutes", DEFAULT_TIME_BUDGET_MINUTES
                 ),
             )
             raw_json = build_collect_output_path(output_dir, payload["asin"])
@@ -2127,6 +2309,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Built-in keyword preset profile used when --keywords has no explicit values.",
     )
     collect.add_argument(
+        "--keyword-tier",
+        choices=list(KEYWORD_TIERS),
+        default=DEFAULT_KEYWORD_TIER,
+        help="Select the built-in keyword tier: core for high-yield terms, explore for long-tail terms, all for both.",
+    )
+    collect.add_argument(
         "--keyword-reuse-scope",
         choices=["successful", "all", "none"],
         default=DEFAULT_KEYWORD_REUSE_SCOPE,
@@ -2147,6 +2335,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_COMBO_DELAY_SECONDS,
         help="Delay in seconds between combo or keyword requests. Default: 2.5",
+    )
+    collect.add_argument(
+        "--time-budget-minutes",
+        type=float,
+        default=DEFAULT_TIME_BUDGET_MINUTES,
+        help="Optional soft time budget. Stop starting new combos/keywords/pages after this many minutes; 0 disables the cap.",
     )
 
     intake = subparsers.add_parser(
@@ -2191,6 +2385,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Built-in keyword preset profile used when --keywords has no explicit values.",
     )
     intake.add_argument(
+        "--keyword-tier",
+        choices=list(KEYWORD_TIERS),
+        default=DEFAULT_KEYWORD_TIER,
+        help="Select the built-in keyword tier: core for high-yield terms, explore for long-tail terms, all for both.",
+    )
+    intake.add_argument(
         "--keyword-reuse-scope",
         choices=["successful", "all", "none"],
         default=DEFAULT_KEYWORD_REUSE_SCOPE,
@@ -2211,6 +2411,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_COMBO_DELAY_SECONDS,
         help="Delay in seconds between combo or keyword requests. Default: 2.5",
+    )
+    intake.add_argument(
+        "--time-budget-minutes",
+        type=float,
+        default=DEFAULT_TIME_BUDGET_MINUTES,
+        help="Optional soft time budget. Stop starting new combos/keywords/pages after this many minutes; 0 disables the cap.",
     )
 
     translate = subparsers.add_parser(
@@ -2335,6 +2541,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Built-in keyword preset profile used when --keywords has no explicit values.",
     )
     batch.add_argument(
+        "--keyword-tier",
+        choices=list(KEYWORD_TIERS),
+        default=DEFAULT_KEYWORD_TIER,
+        help="Select the built-in keyword tier: core for high-yield terms, explore for long-tail terms, all for both.",
+    )
+    batch.add_argument(
         "--keyword-reuse-scope",
         choices=["successful", "all", "none"],
         default=DEFAULT_KEYWORD_REUSE_SCOPE,
@@ -2355,6 +2567,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_COMBO_DELAY_SECONDS,
         help="Delay in seconds between combo or keyword requests. Default: 2.5",
+    )
+    batch.add_argument(
+        "--time-budget-minutes",
+        type=float,
+        default=DEFAULT_TIME_BUDGET_MINUTES,
+        help="Optional soft time budget. Stop starting new combos/keywords/pages after this many minutes; 0 disables the cap.",
     )
 
     summary = subparsers.add_parser(

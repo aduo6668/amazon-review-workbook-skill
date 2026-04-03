@@ -77,6 +77,8 @@ Examples:
 
 ```bash
 python scripts/amazon_review_workbook.py collect --url "<amazon-url>" --output-dir "<workspace>/amazon-review-output"
+python scripts/amazon_review_workbook.py collect --url "<amazon-url>" --output-dir "<workspace>/amazon-review-output" --keywords --keyword-profile electronics --keyword-tier core
+python scripts/amazon_review_workbook.py collect --url "<amazon-url>" --output-dir "<workspace>/amazon-review-output" --keywords --keyword-profile electronics --keyword-tier core --time-budget-minutes 5
 python scripts/amazon_review_workbook.py translate --input-json "<workspace>/amazon-review-output/amazon_<asin>_review_rows_factual.json" --output-dir "<workspace>/amazon-review-output"
 python scripts/amazon_review_workbook.py coverage-check --url "<amazon-url>" --db-path "<workspace>/amazon-review-output/amazon_review_cache.sqlite3"
 python scripts/amazon_review_workbook.py keyword-autotune --output-dir "<workspace>/amazon-review-output" --db-path "<workspace>/amazon-review-output/amazon_review_cache.sqlite3"
@@ -125,11 +127,16 @@ The preferred fast path is:
 - Use `--keywords` only when you explicitly want a keyword pass.
 - Use `--keywords` with no values to run the built-in keyword preset for the selected `--keyword-profile`.
 - Use `--keywords foo bar baz` to provide an explicit keyword list.
+- Use `--keyword-tier core` when you only want the higher-yield seed terms from the selected profile.
+- Use `--keyword-tier explore` when you specifically want the long-tail exploration terms; this tier favors the most domain-specific tail words first.
+- Leave `--keyword-tier` at `all` to preserve the old behavior and run both tiers.
+- Use `--time-budget-minutes 5` when you want a bounded probe run first; the collector will stop opening new combos, keywords, or pages after the budget is exhausted and still keep partial output.
 - Default pacing now inserts a `2.5s` gap between combos/keywords to reduce rate-limit risk.
 - Built-in profiles:
   - `generic`: universal consumer-product terms
   - `electronics`: universal terms + common app/setup/hardware terms
   - `dashcam`: electronics profile + recording/night/parking/GPS/Wi-Fi/mount terms
+- Every built-in profile is now split into `core` and `explore` tiers so we can validate tuned keywords on real products without committing to the whole long-tail pass up front.
 - Default keyword reuse policy is `successful`: keywords that have produced results before are skipped on later runs; recent zero-result keywords are also suppressed for `72h` to avoid immediate retries.
 - If you really want to brute-force rerun every keyword, use `--keyword-reuse-scope none`.
 - A tuned state file at `<output-dir>/keyword_tuning_state.json` is now read automatically when present, and refreshed after keyword runs so the skill gradually reorders towards higher-yield terms.

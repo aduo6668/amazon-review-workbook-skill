@@ -12,12 +12,16 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from amazon_review_workbook import (
     DEFAULT_KEYWORDS,
+    build_time_budget_deadline,
     build_keyword_tuning_state,
     build_keyword_profile,
     extract_page_totals,
+    remaining_time_budget_seconds,
     resolve_keyword_plan,
     score_keyword_stats,
+    time_budget_reached,
     should_skip_keyword,
+    sleep_with_time_budget,
 )
 from label_workflow import heuristic_category
 from review_delivery_schema import DELIVERY_COLUMNS, normalize_categories
@@ -47,6 +51,18 @@ class ReviewWorkbookContractTests(unittest.TestCase):
         self.assertEqual(mode, "profile:electronics:tuned")
         self.assertEqual(keywords, DEFAULT_KEYWORDS[:12])
 
+    def test_keyword_plan_can_target_core_tier(self) -> None:
+        keywords, mode = resolve_keyword_plan(
+            [],
+            "electronics",
+            keyword_tier="core",
+        )
+        self.assertEqual(mode, "profile:electronics:core:tuned")
+        self.assertEqual(
+            keywords,
+            ["quality", "problem", "broken", "refund", "support", "durable", "app", "setup", "install", "battery", "cable"],
+        )
+
     def test_keyword_plan_preserves_explicit_values(self) -> None:
         keywords, mode = resolve_keyword_plan(
             ["quality", "refund", "quality"], "dashcam"
@@ -59,6 +75,13 @@ class ReviewWorkbookContractTests(unittest.TestCase):
         self.assertIn("quality", keywords)
         self.assertIn("app", keywords)
         self.assertIn("night", keywords)
+
+    def test_dashcam_profile_explore_tier_contains_long_tail_terms(self) -> None:
+        keywords = build_keyword_profile("dashcam", tier="explore")
+        self.assertNotIn("quality", keywords)
+        self.assertIn("gps", keywords)
+        self.assertIn("wifi", keywords)
+        self.assertIn("rear camera", keywords)
 
     def test_extract_page_totals_distinguishes_reviews_and_ratings(self) -> None:
         totals = extract_page_totals(
@@ -149,8 +172,54 @@ class ReviewWorkbookContractTests(unittest.TestCase):
             top_k=5,
         )
         dashcam_keywords = payload["profiles"]["dashcam"]["recommended_keywords"]
+        dashcam_core_keywords = payload["profiles"]["dashcam"][
+            "recommended_keywords_by_tier"
+        ]["core"]
+        dashcam_explore_keywords = payload["profiles"]["dashcam"][
+            "recommended_keywords_by_tier"
+        ]["explore"]
         self.assertEqual(dashcam_keywords[0], "video")
+        self.assertEqual(dashcam_core_keywords[0], "video")
         self.assertIn("install", dashcam_keywords)
+        self.assertIn("install", dashcam_core_keywords)
+        self.assertIn("gps", dashcam_explore_keywords)
+
+    def test_time_budget_helpers_handle_disabled_budget(self) -> None:
+        self.assertIsNone(build_time_budget_deadline(0, now_monotonic=100.0))
+        self.assertFalse(time_budget_reached(None, now_monotonic=999.0))
+        self.assertEqual(
+            remaining_time_budget_seconds(None, now_monotonic=999.0), float("inf")
+        )
+
+    def test_time_budget_helpers_track_deadline_and_remaining(self) -> None:
+        deadline = build_time_budget_deadline(5, now_monotonic=100.0)
+        self.assertEqual(deadline, 400.0)
+        self.assertFalse(time_budget_reached(deadline, now_monotonic=399.9))
+        self.assertTrue(time_budget_reached(deadline, now_monotonic=400.0))
+        self.assertAlmostEqual(
+            remaining_time_budget_seconds(deadline, now_monotonic=250.0), 150.0
+        )
+
+    def test_sleep_with_time_budget_clamps_to_remaining_time(self) -> None:
+        import amazon_review_workbook as workbook
+
+        calls: list[float] = []
+        original_sleep = workbook.time.sleep
+        original_monotonic = workbook.time.monotonic
+        try:
+            workbook.time.sleep = calls.append
+            workbook.time.monotonic = lambda: 100.0
+            sleep_with_time_budget(5.0, 103.0)
+            self.assertEqual(calls, [3.0])
+            calls.clear()
+            sleep_with_time_budget(5.0, 101.5)
+            self.assertEqual(calls, [1.5])
+            calls.clear()
+            sleep_with_time_budget(5.0, 100.0)
+            self.assertEqual(calls, [])
+        finally:
+            workbook.time.sleep = original_sleep
+            workbook.time.monotonic = original_monotonic
 
 
 if __name__ == "__main__":
